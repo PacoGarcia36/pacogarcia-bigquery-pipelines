@@ -5,6 +5,11 @@ Tablas destino:
   vtex_data.daily_orders  — una fila por orden
   vtex_data.order_items   — una fila por item de cada orden
 
+Vistas que crea (ensure_views, en cada corrida):
+  vtex_data.vw_dias_cargados   — salud de la carga por fecha: dia_completo,
+                                 horas_cubiertas, ultimo_sync, tiene_duplicados
+  vtex_data.vw_ventas_diarias  — KPIs diarios con la bandera dia_completo al lado
+
 INSERCIÓN: load_table_from_json (BATCH — NO streaming inserts — costo $0 en BQ).
 
 IDEMPOTENCIA: toda fecha que ya tenga filas se borra (DELETE por fecha) justo
@@ -15,6 +20,14 @@ VENTANA MÓVIL: los últimos --refresh-days días se recargan SIEMPRE, aunque ya
 estén en BQ. Sin esto, el día en curso queda cargado con las órdenes que había
 a la hora del run (media mañana) y las corridas siguientes lo saltean para
 siempre, perdiendo todo el pico de ventas de la tarde.
+
+DÍA PARCIAL: la ventana móvil arregla la fecha, pero recién en la corrida
+siguiente. Entre un run y el otro la fecha más fresca de la tabla es real e
+incompleta a la vez, y nada en `daily_orders` lo distingue de una fecha cerrada.
+Para eso está `vw_dias_cargados.dia_completo`: comparar el último `synced_at` de
+la fecha contra las 00:00 ART del día siguiente. Consultar los últimos días sin
+mirar esa bandera ya hizo leer un domingo capturado a medio día como una caída
+de ventas que no había pasado.
 
 Uso:
     python sync_vtex.py                          # últimos 365 días (+ refresh de 7)
@@ -40,6 +53,8 @@ GCP_PROJECT  = "e-coomerce-484513"
 BQ_DATASET   = "vtex_data"
 TABLE_ORDERS = "daily_orders"
 TABLE_ITEMS  = "order_items"
+VIEW_DIAS    = "vw_dias_cargados"
+VIEW_VENTAS  = "vw_ventas_diarias"
 
 # Argentina = UTC-3 sin DST
 ARS_OFFSET = timedelta(hours=3)
@@ -143,6 +158,92 @@ def setup_bq(bq: bigquery.Client) -> tuple[str, str]:
         bq.create_table(t, exists_ok=True)
 
     return ref_orders, ref_items
+
+
+# ── Vistas: marcar el día parcial ─────────────────────────────────────────────
+# El problema que estas vistas resuelven: la sync carga el día EN CURSO truncado
+# a la hora del run, y `daily_orders` no dice en ninguna parte que esa fecha
+# todavía no está cerrada. La ventana móvil de --refresh-days la completa recién
+# en la corrida siguiente, así que entre un run y el otro la fecha más fresca de
+# la tabla es un número real pero incompleto, indistinguible de uno definitivo.
+# Con la sync de la mañana, un domingo llegó a quedar con menos de un cuarto de
+# sus pedidos y se leyó como un derrumbe de ventas que no existió.
+#
+# La regla es una sola: un día de Argentina termina a las 00:00 ART del día
+# siguiente. Si el último `synced_at` de esa fecha es POSTERIOR a ese momento,
+# la sync la vio ya cerrada y el día está completo. Si es anterior, la foto se
+# tomó con el día todavía abierto y falta lo que entró después.
+def ensure_views(bq: bigquery.Client) -> None:
+    ref_orders = f"{GCP_PROJECT}.{BQ_DATASET}.{TABLE_ORDERS}"
+    ref_items  = f"{GCP_PROJECT}.{BQ_DATASET}.{TABLE_ITEMS}"
+
+    # Salud de la carga, una fila por fecha. Es la vista que hay que mirar antes
+    # de creerle a cualquier consulta sobre los últimos días.
+    sql_dias = f"""
+    CREATE OR REPLACE VIEW `{GCP_PROJECT}.{BQ_DATASET}.{VIEW_DIAS}` AS
+    WITH por_fecha AS (
+      SELECT
+        creation_date                                   AS fecha,
+        COUNT(*)                                        AS pedidos,
+        COUNT(DISTINCT order_id)                        AS pedidos_unicos,
+        COUNTIF(status = 'canceled')                    AS cancelados,
+        ROUND(SUM(total_value_ars), 2)                  AS monto_ars,
+        MAX(synced_at)                                  AS ultimo_sync
+      FROM `{ref_orders}`
+      GROUP BY fecha
+    )
+    SELECT
+      fecha,
+      pedidos,
+      pedidos_unicos,
+      cancelados,
+      monto_ars,
+      ultimo_sync,
+      -- 00:00 ART del día siguiente = momento en que la fecha queda cerrada
+      TIMESTAMP(DATE_ADD(fecha, INTERVAL 1 DAY),
+                'America/Argentina/Buenos_Aires')       AS cierra_a,
+      ultimo_sync >= TIMESTAMP(DATE_ADD(fecha, INTERVAL 1 DAY),
+                               'America/Argentina/Buenos_Aires') AS dia_completo,
+      -- cuántas horas del día ART alcanzó a ver la sync (24 = completo)
+      LEAST(24.0, GREATEST(0.0, ROUND(TIMESTAMP_DIFF(
+        ultimo_sync,
+        TIMESTAMP(fecha, 'America/Argentina/Buenos_Aires'),
+        MINUTE) / 60.0, 1)))                            AS horas_cubiertas,
+      pedidos <> pedidos_unicos                       AS tiene_duplicados
+    FROM por_fecha
+    """
+    bq.query(sql_dias).result()
+
+    # KPIs diarios listos para graficar. Trae TODAS las fechas —incluida la
+    # parcial— pero con la bandera al lado: el que grafica decide si corta el
+    # último punto o lo dibuja punteado. Filtrar en silencio sería el mismo
+    # error al revés (un día que desaparece también se lee como caída).
+    sql_ventas = f"""
+    CREATE OR REPLACE VIEW `{GCP_PROJECT}.{BQ_DATASET}.{VIEW_VENTAS}` AS
+    SELECT
+      o.creation_date                                       AS fecha,
+      FORMAT_DATE('%A', o.creation_date)                    AS dia_semana,
+      COUNT(DISTINCT o.order_id)                            AS pedidos,
+      COUNT(DISTINCT IF(o.status = 'canceled', o.order_id, NULL))   AS pedidos_cancelados,
+      COUNT(DISTINCT IF(o.status <> 'canceled', o.order_id, NULL))  AS pedidos_no_cancelados,
+      ROUND(SUM(o.total_value_ars), 2)                      AS monto_ars,
+      ROUND(SUM(IF(o.status <> 'canceled', o.total_value_ars, 0)), 2)
+                                                            AS monto_no_cancelado_ars,
+      ROUND(SAFE_DIVIDE(SUM(IF(o.status <> 'canceled', o.total_value_ars, 0)),
+                        COUNT(DISTINCT IF(o.status <> 'canceled', o.order_id, NULL))), 2)
+                                                            AS ticket_ars,
+      SUM(o.items_count)                                    AS unidades,
+      d.dia_completo,
+      d.horas_cubiertas,
+      d.ultimo_sync
+    FROM `{ref_orders}` o
+    JOIN `{GCP_PROJECT}.{BQ_DATASET}.{VIEW_DIAS}` d
+      ON d.fecha = o.creation_date
+    GROUP BY fecha, dia_semana, d.dia_completo, d.horas_cubiertas, d.ultimo_sync
+    """
+    bq.query(sql_ventas).result()
+
+    print(f"   Vistas OK   : {VIEW_DIAS}, {VIEW_VENTAS}")
 
 
 # ── Dedup ─────────────────────────────────────────────────────────────────────
@@ -463,6 +564,10 @@ def main():
 
     bq = _bq_client()
     ref_orders, ref_items = setup_bq(bq)
+
+    # Antes del early-return de "todo al día": las vistas tienen que quedar
+    # creadas incluso en una corrida que no carga ninguna fecha.
+    ensure_views(bq)
 
     # loaded se calcula SIEMPRE: además de decidir qué saltear, dice qué fechas
     # hay que borrar antes de recargar para no duplicar filas.

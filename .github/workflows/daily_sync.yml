@@ -2,7 +2,25 @@ name: Daily Sync
 
 on:
   schedule:
-    - cron: '0 12 * * *'   # todos los días 12:00 UTC = 09:00 Argentina
+    # Dos corridas por día, y la de la madrugada NO es redundante.
+    #
+    # La de 12:00 UTC (09:00 ART) carga el día EN CURSO, que por definición
+    # queda truncado a la hora del run: VTEX sigue recibiendo órdenes las 12 h
+    # siguientes, justo en el pico de ventas (13-20 ART). La ventana móvil de
+    # --refresh-days lo completaba recién en la corrida del día siguiente, así
+    # que la fecha más fresca de BigQuery pasaba ~24 h siendo incompleta sin que
+    # nada lo dijera. Un domingo llegó así al lunes a la tarde con menos de un
+    # cuarto de sus pedidos, y se leyó como un derrumbe de ventas que no existió.
+    #
+    # La de 03:30 UTC (00:30 ART) corre con el día anterior ya CERRADO, así que
+    # lo deja completo dentro de la hora. Además le da sentido al guardrail:
+    # verify_vtex.py audita hasta ayer, y ahora "ayer" es una fecha que la sync
+    # acaba de terminar de cargar, no una que va a completar en 12 h.
+    #
+    # GitHub atrasa los cron de repos gratuitos entre 1 y 4 h. 03:30 UTC tolera
+    # ese atraso sin volver a caer dentro del día que tiene que auditar.
+    - cron: '30 3 * * *'   # 03:30 UTC = 00:30 ART — cierra el día anterior
+    - cron: '0 12 * * *'   # 12:00 UTC = 09:00 ART — adelanta el día en curso
   workflow_dispatch:            # permite trigger manual desde GitHub UI
 
 jobs:
