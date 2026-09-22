@@ -143,6 +143,43 @@ jobs:
           GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
         run: python verify_vtex.py --days 30
 
+      # Los costos por SKU no los actualizaba NADA: la tabla se habia cargado a
+      # mano una vez y quedo con el 17,5% del catalogo activo y una foto del
+      # 2026-09-08. Eso no se notaba porque no rompe nada: simplemente el margen
+      # sale NULL y las consultas lo ignoran en silencio. El 2026-09-22 se
+      # completaron los 9.530 SKUs faltantes y la cobertura quedo en 100%.
+      #
+      # Sin flags carga SOLO los SKUs que todavia no tienen costo, asi que en una
+      # corrida normal son los productos dados de alta ese dia: tarda segundos.
+      #
+      # Los lunes temprano refresca TODO el catalogo activo. Eso cuesta ~80 min de
+      # llamadas a VTEX, pero es lo unico que va armando la serie historica de
+      # precios. Sin ella no se puede datar un cambio de precio: cuando quisimos
+      # saber si las subas de septiembre eran anteriores al Paco Sale, la unica
+      # evidencia disponible eran los precios de las ordenes, que solo existen si
+      # el producto se vendio. La tabla es append-only, cada corrida agrega una
+      # foto nueva y nunca pisa las anteriores.
+      #
+      # Va al final y despues del cooldown de VTEX a proposito: comparte el rate
+      # limit con sync_vtex y verify_vtex, y no tiene sentido que compita con
+      # ellos por la cuota.
+      - name: Sync costos de SKU
+        id: sku_costs
+        continue-on-error: true
+        env:
+          GOOGLE_SERVICE_ACCOUNT_FILE: service_account.json
+          VTEX_ACCOUNT: ${{ secrets.VTEX_ACCOUNT }}
+          VTEX_APP_KEY: ${{ secrets.VTEX_APP_KEY }}
+          VTEX_APP_TOKEN: ${{ secrets.VTEX_APP_TOKEN }}
+          GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
+        run: |
+          if [ "$(date -u +%u)" = "1" ] && [ "$(date -u +%H)" -lt 10 ]; then
+            echo "Lunes temprano: refresco completo del catalogo para la serie de precios"
+            python sync_sku_costs.py --todos
+          else
+            python sync_sku_costs.py
+          fi
+
       # El snapshot de stock NO corre acá: vive en su propio workflow
       # (stock_sync.yml), que se dispara a las 21:30 UTC = 18:30 ART. El motivo es
       # de negocio, no técnico: en VTEX el stock físico se actualiza todos los días
@@ -161,8 +198,10 @@ jobs:
           meta="${{ steps.meta_ads.outcome }}"
           vtex="${{ steps.vtex.outcome }}"
           ver="${{ steps.vtex_verify.outcome }}"
-          echo "Outcomes -> Search Console=$sc | Google Ads=$ads | Meta Ads=$meta | VTEX=$vtex | VTEX verify=$ver"
+          cost="${{ steps.sku_costs.outcome }}"
+          echo "Outcomes -> Search Console=$sc | Google Ads=$ads | Meta Ads=$meta | VTEX=$vtex | VTEX verify=$ver | Costos SKU=$cost"
           fail=0
+          if [ "$cost" = "failure" ]; then echo "::error::Sync de costos de SKU failed -- revisar si la API de Pricing de VTEX devolvio 429 (rate limit) o si las credenciales VTEX_APP_KEY/TOKEN perdieron el scope de pricing"; fail=1; fi
           if [ "$sc" = "failure" ];   then echo "::error::Search Console sync failed"; fail=1; fi
           if [ "$ads" = "failure" ];  then echo "::error::Google Ads sync failed";     fail=1; fi
           if [ "$meta" = "failure" ]; then echo "::error::Meta Ads sync failed -- si el log dice (#190), el token de usuario vencio y hay que regenerar el secret META_ACCESS_TOKEN"; fail=1; fi
