@@ -55,6 +55,7 @@ TABLE_ORDERS = "daily_orders"
 TABLE_ITEMS  = "order_items"
 VIEW_DIAS    = "vw_dias_cargados"
 VIEW_VENTAS  = "vw_ventas_diarias"
+VIEW_GEO     = "vw_ventas_por_provincia"
 
 # Argentina = UTC-3 sin DST
 ARS_OFFSET = timedelta(hours=3)
@@ -243,7 +244,88 @@ def ensure_views(bq: bigquery.Client) -> None:
     """
     bq.query(sql_ventas).result()
 
-    print(f"   Vistas OK   : {VIEW_DIAS}, {VIEW_VENTAS}")
+    # VTEX guarda la provincia como texto libre, tal como llega del checkout, así
+    # que el mismo lugar aparece escrito de varias formas: "Tucumán", "TUCUMÁN" y
+    # "Tucuman" son tres filas distintas en cualquier GROUP BY. Al 2026-09-29 eran
+    # 55 valores para 24 provincias reales, y Tucumán quedaba partido en tres
+    # pedazos (16.860 + 2.146 + 24) — cualquier ranking por provincia salía mal.
+    #
+    # La normalización es en dos pasos: NFD descompone los acentos y \pM borra los
+    # diacríticos, así "TUCUMÁN" y "Tucuman" colapsan en "TUCUMAN"; después el CASE
+    # mapea a la grafía oficial. "Capital Federal" y "Ciudad Autónoma de Buenos
+    # Aires" son el mismo distrito y se unifican en CABA.
+    #
+    # El ELSE deja pasar lo que no reconoce en vez de mandarlo a "Otros": si mañana
+    # VTEX empieza a mandar una grafía nueva, aparece a la vista en el ranking en
+    # lugar de esconderse dentro de una bolsa.
+    sql_geo = f"""
+    CREATE OR REPLACE VIEW `{GCP_PROJECT}.{BQ_DATASET}.{VIEW_GEO}` AS
+    WITH base AS (
+      SELECT
+        o.*,
+        REGEXP_REPLACE(NORMALIZE(UPPER(TRIM(o.shipping_state)), NFD), r'\\pM', '') AS _norm
+      FROM `{ref_orders}` o
+      WHERE o.shipping_state IS NOT NULL AND TRIM(o.shipping_state) <> ''
+    )
+    SELECT
+      CASE _norm
+        WHEN 'TUCUMAN'                          THEN 'Tucumán'
+        WHEN 'BUENOS AIRES'                     THEN 'Buenos Aires'
+        WHEN 'CORDOBA'                          THEN 'Córdoba'
+        WHEN 'SANTA FE'                         THEN 'Santa Fe'
+        WHEN 'CAPITAL FEDERAL'                  THEN 'CABA'
+        WHEN 'CIUDAD AUTONOMA DE BUENOS AIRES'  THEN 'CABA'
+        WHEN 'SANTIAGO DEL ESTERO'              THEN 'Santiago del Estero'
+        WHEN 'ENTRE RIOS'                       THEN 'Entre Ríos'
+        WHEN 'RIO NEGRO'                        THEN 'Río Negro'
+        WHEN 'NEUQUEN'                          THEN 'Neuquén'
+        WHEN 'SALTA'                            THEN 'Salta'
+        WHEN 'MENDOZA'                          THEN 'Mendoza'
+        WHEN 'MISIONES'                         THEN 'Misiones'
+        WHEN 'CORRIENTES'                       THEN 'Corrientes'
+        WHEN 'JUJUY'                            THEN 'Jujuy'
+        WHEN 'CHACO'                            THEN 'Chaco'
+        WHEN 'SAN LUIS'                         THEN 'San Luis'
+        WHEN 'SANTA CRUZ'                       THEN 'Santa Cruz'
+        WHEN 'CATAMARCA'                        THEN 'Catamarca'
+        WHEN 'CHUBUT'                           THEN 'Chubut'
+        WHEN 'SAN JUAN'                         THEN 'San Juan'
+        WHEN 'FORMOSA'                          THEN 'Formosa'
+        WHEN 'LA PAMPA'                         THEN 'La Pampa'
+        WHEN 'LA RIOJA'                          THEN 'La Rioja'
+        WHEN 'TIERRA DEL FUEGO'                 THEN 'Tierra del Fuego'
+        ELSE INITCAP(_norm)
+      END                                                   AS provincia,
+      -- La región sirve para leer el negocio: Tucumán solo es el 68% de los
+      -- pedidos, así que sin agrupar el resto no se ve nada más.
+      CASE
+        WHEN _norm = 'TUCUMAN' THEN 'Tucumán (local)'
+        WHEN _norm IN ('SALTA','JUJUY','SANTIAGO DEL ESTERO','CATAMARCA','LA RIOJA')
+          THEN 'NOA (resto)'
+        WHEN _norm IN ('CHACO','CORRIENTES','MISIONES','FORMOSA')          THEN 'NEA'
+        WHEN _norm IN ('BUENOS AIRES','CAPITAL FEDERAL',
+                       'CIUDAD AUTONOMA DE BUENOS AIRES','LA PAMPA')       THEN 'AMBA y Buenos Aires'
+        WHEN _norm IN ('CORDOBA','SANTA FE','ENTRE RIOS')                  THEN 'Centro y Litoral'
+        WHEN _norm IN ('MENDOZA','SAN JUAN','SAN LUIS')                    THEN 'Cuyo'
+        WHEN _norm IN ('NEUQUEN','RIO NEGRO','CHUBUT','SANTA CRUZ','TIERRA DEL FUEGO')
+          THEN 'Patagonia'
+        ELSE 'Sin clasificar'
+      END                                                   AS region,
+      creation_date,
+      order_id,
+      status,
+      total_value_ars,
+      payment_name,
+      installments,
+      postal_code,
+      shipping_method,
+      IF(shipping_method LIKE 'Retiro%', 'Retiro en sucursal', 'Envío a domicilio') AS tipo_envio,
+      shipping_state                                        AS provincia_cruda
+    FROM base
+    """
+    bq.query(sql_geo).result()
+
+    print(f"   Vistas OK   : {VIEW_DIAS}, {VIEW_VENTAS}, {VIEW_GEO}")
 
 
 # ── Dedup ─────────────────────────────────────────────────────────────────────
