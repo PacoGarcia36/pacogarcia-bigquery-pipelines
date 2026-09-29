@@ -39,6 +39,7 @@ Uso:
 import os
 import sys
 import time
+import hashlib
 import argparse
 from datetime import datetime, timedelta, timezone, date
 from dotenv import load_dotenv
@@ -56,6 +57,24 @@ TABLE_ITEMS  = "order_items"
 VIEW_DIAS    = "vw_dias_cargados"
 VIEW_VENTAS  = "vw_ventas_diarias"
 VIEW_GEO     = "vw_ventas_por_provincia"
+
+# Salt para hashear el DNI antes de guardarlo. Un SHA-256 pelado de un DNI no
+# protege nada: son 8 dígitos, o sea 100 millones de combinaciones, y una notebook
+# las prueba todas en minutos. Con salt eso deja de ser posible.
+#
+# TIENE QUE SER SIEMPRE EL MISMO. Si cambia, los hashes nuevos no cruzan con los
+# viejos y la historia de recompra se parte al medio. Por eso el script se planta
+# si falta en vez de inventar uno: un salt distinto en cada corrida sería peor que
+# no tener ninguno, porque el daño no se vería hasta mucho después.
+CUSTOMER_HASH_SALT = os.environ.get("CUSTOMER_HASH_SALT", "")
+if not CUSTOMER_HASH_SALT:
+    sys.exit(
+        "ERROR: falta CUSTOMER_HASH_SALT.\n"
+        "  Es el salt con el que se hashea el DNI antes de guardarlo en BigQuery.\n"
+        "  Generar UNA sola vez con:  python -c \"import secrets; print(secrets.token_hex(32))\"\n"
+        "  y cargarlo en el .env local y en el secret CUSTOMER_HASH_SALT del repo.\n"
+        "  No cambiarlo nunca: los hashes viejos dejarían de cruzar con los nuevos."
+    )
 
 # Argentina = UTC-3 sin DST
 ARS_OFFSET = timedelta(hours=3)
@@ -108,6 +127,11 @@ SCHEMA_ORDERS = [
     bigquery.SchemaField("installments",    "INTEGER",   mode="NULLABLE"),
     bigquery.SchemaField("postal_code",     "STRING",    mode="NULLABLE"),
     bigquery.SchemaField("discount_value",  "FLOAT",     mode="NULLABLE"),
+    # Identidad del cliente — ver el comentario largo donde se completan, más abajo.
+    # Ninguna de las dos es un dato personal: user_profile_id es un id opaco de VTEX
+    # y document_hash es el DNI pasado por SHA-256 con salt.
+    bigquery.SchemaField("user_profile_id", "STRING",    mode="NULLABLE"),
+    bigquery.SchemaField("document_hash",   "STRING",    mode="NULLABLE"),
     bigquery.SchemaField("synced_at",       "TIMESTAMP", mode="NULLABLE"),
 ]
 
@@ -765,6 +789,32 @@ def main():
             utm_medium   = (md.get("utmMedium")   or None) or order.get("utmMedium")
             utm_campaign = (md.get("utmCampaign") or None) or order.get("utmCampaign")
 
+            # Identidad del cliente. Sin esto no se puede responder nada de recompra:
+            # cuántas veces compró alguien, cada cuánto vuelve, qué compró la vez
+            # anterior. La tabla tenía la orden pero no quién la hizo.
+            #
+            # Se guardan DOS claves y ninguna es el DNI en crudo:
+            #
+            #   user_profile_id — identificador interno de VTEX, opaco. No dice quién
+            #     es la persona, solo que es la misma que compró antes. Verificado
+            #     sobre 300 órdenes: agrupa idéntico al DNI (283 clientes con las dos
+            #     claves), y viene en el 99,7% de las órdenes.
+            #
+            #   document_hash — SHA-256 del DNI con salt. Sirve para cruzar contra
+            #     otro sistema (sucursales, ERP) hasheando esa lista con el MISMO
+            #     salt. El salt vive en CUSTOMER_HASH_SALT y nunca debe cambiar: si
+            #     cambia, los hashes viejos dejan de cruzar con los nuevos.
+            #
+            # El email NO se usa como clave: VTEX lo entrega enmascarado y distinto
+            # en cada orden (300 valores distintos en 300 órdenes).
+            cp = (detail or {}).get("clientProfileData") or {}
+            user_profile_id = cp.get("userProfileId") or None
+            doc = (cp.get("document") or "").strip()
+            document_hash = (
+                hashlib.sha256((CUSTOMER_HASH_SALT + doc).encode()).hexdigest()
+                if doc else None
+            )
+
             order_rows.append({
                 "order_id":        order_id,
                 "creation_date":   ars_date_str,
@@ -782,6 +832,8 @@ def main():
                 "installments":    installments,
                 "postal_code":     postal_code,
                 "discount_value":  discount_value,
+                "user_profile_id": user_profile_id,
+                "document_hash":   document_hash,
                 "synced_at":       synced_at,
             })
 
