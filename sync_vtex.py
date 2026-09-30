@@ -45,6 +45,7 @@ Uso:
     python sync_vtex.py --reprocess --start-date 2026-06-10 --end-date 2026-07-28  # backfill
 """
 import os
+import re
 import sys
 import time
 import argparse
@@ -117,6 +118,8 @@ SCHEMA_ORDERS = [
     bigquery.SchemaField("installments",    "INTEGER",   mode="NULLABLE"),
     bigquery.SchemaField("postal_code",     "STRING",    mode="NULLABLE"),
     bigquery.SchemaField("discount_value",  "FLOAT",     mode="NULLABLE"),
+    bigquery.SchemaField("customer_email",    "STRING",  mode="NULLABLE"),
+    bigquery.SchemaField("customer_document", "STRING",  mode="NULLABLE"),
     bigquery.SchemaField("synced_at",       "TIMESTAMP", mode="NULLABLE"),
 ]
 
@@ -153,6 +156,20 @@ def _ars_day_utc_range(ars_date: date) -> tuple[str, str]:
     utc_start = datetime(ars_date.year, ars_date.month, ars_date.day, 3, 0, 0)
     utc_end   = utc_start + timedelta(days=1) - timedelta(seconds=1)
     return utc_start.strftime("%Y-%m-%dT%H:%M:%S"), utc_end.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+# VTEX le agrega a clientProfileData.email un sufijo de alias POR PEDIDO
+# (ej: "juan@gmail.com-260602796249b.ct.vtex.com.br") — el email real queda
+# legible antes del sufijo, pero el sufijo cambia en cada pedido del mismo
+# cliente, así que usarlo tal cual rompe cualquier cruce de recurrencia.
+# Confirmado en vivo el 2026-09-30 contra 4 pedidos reales.
+_EMAIL_ALIAS_SUFFIX_RE = re.compile(r"-\d+b\.ct\.vtex\.com\.br$", re.IGNORECASE)
+
+
+def _clean_customer_email(raw_email: str | None) -> str | None:
+    if not raw_email:
+        return None
+    return _EMAIL_ALIAS_SUFFIX_RE.sub("", raw_email).strip() or None
 
 
 def _vtex_date_to_ars_date(vtex_date: str) -> str:
@@ -782,13 +799,21 @@ def main():
             installments = payment[0].get("installments") if payment else None
 
             # Extraer provincia, método de envío y campos nuevos del detalle
-            shipping_state  = None
-            shipping_method = None
-            seller_id       = None
-            postal_code     = None
-            cancel_reason   = None
-            discount_value  = None
+            shipping_state    = None
+            shipping_method   = None
+            seller_id         = None
+            postal_code       = None
+            cancel_reason     = None
+            discount_value    = None
+            customer_email    = None
+            customer_document = None
             if detail:
+                try:
+                    client = detail.get("clientProfileData") or {}
+                    customer_email    = _clean_customer_email(client.get("email"))
+                    customer_document = client.get("document") or None
+                except Exception:
+                    pass
                 try:
                     logistics = detail.get("shippingData", {}).get("logisticsInfo", [{}])
                     if logistics:
@@ -832,6 +857,8 @@ def main():
                 "installments":    installments,
                 "postal_code":     postal_code,
                 "discount_value":  discount_value,
+                "customer_email":    customer_email,
+                "customer_document": customer_document,
                 "synced_at":       synced_at,
             })
 
