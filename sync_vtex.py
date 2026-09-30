@@ -2,8 +2,16 @@
 sync_vtex.py — carga órdenes e items de VTEX a BigQuery.
 
 Tablas destino:
-  vtex_data.daily_orders  — una fila por orden
-  vtex_data.order_items   — una fila por item de cada orden
+  vtex_data.daily_orders    — una fila por orden
+  vtex_data.order_items     — una fila por item de cada orden (sin sku_id)
+  vtex_data.order_items_sku — una fila por item CON sku_id/ref_id, para margen
+                              por SKU (sales_sku/sales_with_cmv/product_profitability
+                              en paco_ai_core dependen de esta tabla). Hasta
+                              2026-09-30 esta tabla se cargó una sola vez a mano
+                              (15,7% de las órdenes, congelada en 2026-09-07) y
+                              nunca se conectó a este pipeline — se agregó acá
+                              reusando el MISMO detalle de orden que ya se pide
+                              para order_items, sin llamadas extra a VTEX.
 
 Vistas que crea (ensure_views, en cada corrida):
   vtex_data.vw_dias_cargados   — salud de la carga por fecha: dia_completo,
@@ -51,8 +59,9 @@ SERVICE_ACCOUNT_FILE = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "e-coomerce
 VTEX_ACCOUNT = os.environ.get("VTEX_ACCOUNT", "pacogarcia")
 GCP_PROJECT  = "e-coomerce-484513"
 BQ_DATASET   = "vtex_data"
-TABLE_ORDERS = "daily_orders"
-TABLE_ITEMS  = "order_items"
+TABLE_ORDERS    = "daily_orders"
+TABLE_ITEMS     = "order_items"
+TABLE_ITEMS_SKU = "order_items_sku"
 VIEW_DIAS    = "vw_dias_cargados"
 VIEW_VENTAS  = "vw_ventas_diarias"
 VIEW_GEO     = "vw_ventas_por_provincia"
@@ -123,6 +132,20 @@ SCHEMA_ITEMS = [
     bigquery.SchemaField("synced_at",     "TIMESTAMP", mode="NULLABLE"),
 ]
 
+# Mismo esquema que la tabla ya existente (carga manual de una vez, ver
+# docstring del módulo) — NO se le agrega creation_date para no romper
+# compatibilidad con las 11.169 filas ya cargadas; el borrado idempotente se
+# hace por order_id (ver delete_date), no por fecha.
+SCHEMA_ITEMS_SKU = [
+    bigquery.SchemaField("order_id",   "STRING",  mode="NULLABLE"),
+    bigquery.SchemaField("sku_id",     "STRING",  mode="NULLABLE"),
+    bigquery.SchemaField("product_id", "STRING",  mode="NULLABLE"),
+    bigquery.SchemaField("ref_id",     "STRING",  mode="NULLABLE"),
+    bigquery.SchemaField("quantity",   "INTEGER", mode="NULLABLE"),
+    bigquery.SchemaField("price",      "NUMERIC", mode="NULLABLE"),
+    bigquery.SchemaField("loaded_at",  "TIMESTAMP", mode="NULLABLE"),
+]
+
 
 # ── Helpers de fecha ──────────────────────────────────────────────────────────
 def _ars_day_utc_range(ars_date: date) -> tuple[str, str]:
@@ -141,13 +164,14 @@ def _vtex_date_to_ars_date(vtex_date: str) -> str:
 
 
 # ── Setup BQ ──────────────────────────────────────────────────────────────────
-def setup_bq(bq: bigquery.Client) -> tuple[str, str]:
+def setup_bq(bq: bigquery.Client) -> tuple[str, str, str]:
     ds_ref = bigquery.Dataset(f"{GCP_PROJECT}.{BQ_DATASET}")
     ds_ref.location = "US"
     bq.create_dataset(ds_ref, exists_ok=True)
 
-    ref_orders = f"{GCP_PROJECT}.{BQ_DATASET}.{TABLE_ORDERS}"
-    ref_items  = f"{GCP_PROJECT}.{BQ_DATASET}.{TABLE_ITEMS}"
+    ref_orders    = f"{GCP_PROJECT}.{BQ_DATASET}.{TABLE_ORDERS}"
+    ref_items     = f"{GCP_PROJECT}.{BQ_DATASET}.{TABLE_ITEMS}"
+    ref_items_sku = f"{GCP_PROJECT}.{BQ_DATASET}.{TABLE_ITEMS_SKU}"
 
     for ref, schema in ((ref_orders, SCHEMA_ORDERS), (ref_items, SCHEMA_ITEMS)):
         t = bigquery.Table(ref, schema=schema)
@@ -158,7 +182,11 @@ def setup_bq(bq: bigquery.Client) -> tuple[str, str]:
         )
         bq.create_table(t, exists_ok=True)
 
-    return ref_orders, ref_items
+    # Sin partición — ya existía así (carga manual previa); no se cambia su
+    # forma física, solo se empieza a alimentar de verdad.
+    bq.create_table(bigquery.Table(ref_items_sku, schema=SCHEMA_ITEMS_SKU), exists_ok=True)
+
+    return ref_orders, ref_items, ref_items_sku
 
 
 # ── Vistas: marcar el día parcial ─────────────────────────────────────────────
@@ -580,7 +608,7 @@ def bq_load(bq: bigquery.Client, table_ref: str, schema, rows: list[dict]) -> st
 
 
 def delete_date(bq: bigquery.Client, ref_orders: str, ref_items: str, ds: str) -> str | None:
-    """Borra todas las filas de una fecha (ambas tablas). Para reproceso. Retorna error o None."""
+    """Borra todas las filas de una fecha (daily_orders + order_items). Para reproceso. Retorna error o None."""
     try:
         for ref in (ref_orders, ref_items):
             bq.query(
@@ -589,6 +617,26 @@ def delete_date(bq: bigquery.Client, ref_orders: str, ref_items: str, ds: str) -
                     query_parameters=[bigquery.ScalarQueryParameter("d", "DATE", ds)]
                 ),
             ).result()
+        return None
+    except Exception as e:
+        return str(e)
+
+
+def delete_order_ids_from_sku(bq: bigquery.Client, ref_items_sku: str, order_ids: list[str]) -> str | None:
+    """
+    Borra de order_items_sku las filas de estos order_id. order_items_sku no tiene
+    creation_date (ver SCHEMA_ITEMS_SKU), así que el borrado idempotente es por
+    order_id en vez de por fecha, a diferencia de daily_orders/order_items.
+    """
+    if not order_ids:
+        return None
+    try:
+        bq.query(
+            f"DELETE FROM `{ref_items_sku}` WHERE order_id IN UNNEST(@ids)",
+            job_config=bigquery.QueryJobConfig(
+                query_parameters=[bigquery.ArrayQueryParameter("ids", "STRING", order_ids)]
+            ),
+        ).result()
         return None
     except Exception as e:
         return str(e)
@@ -645,7 +693,7 @@ def main():
     print()
 
     bq = _bq_client()
-    ref_orders, ref_items = setup_bq(bq)
+    ref_orders, ref_items, ref_items_sku = setup_bq(bq)
 
     # Antes del early-return de "todo al día": las vistas tienen que quedar
     # creadas incluso en una corrida que no carga ninguna fecha.
@@ -676,6 +724,7 @@ def main():
 
     total_orders  = 0
     total_items   = 0
+    total_items_sku = 0
     dates_ok      = 0
     dates_empty   = 0
     api_errors    = 0
@@ -703,8 +752,9 @@ def main():
 
         print(f"{len(orders_raw)} órdenes → detalle...", end=" ", flush=True)
 
-        order_rows = []
-        item_rows  = []
+        order_rows    = []
+        item_rows     = []
+        item_sku_rows = []
 
         for order in orders_raw:
             order_id = order["orderId"]
@@ -802,15 +852,42 @@ def main():
                     "synced_at":    synced_at,
                 })
 
+                # order_items_sku: mismo item, sin llamada extra a VTEX — el
+                # detalle de orden ya trae id (=sku_id) y refId. price queda SIN
+                # dividir por 100, igual que las 11.169 filas ya cargadas (que
+                # sales_sku divide por 100 río abajo, ver paco_ai_core.sales_sku).
+                sku_id = str(item.get("id", "")) or None
+                item_sku_rows.append({
+                    "order_id":   order_id,
+                    "sku_id":     sku_id,
+                    "product_id": product_id,
+                    "ref_id":     item.get("refId"),
+                    "quantity":   item.get("quantity"),
+                    "price":      item.get("price"),
+                    "loaded_at":  synced_at,
+                })
+
         # Si la fecha ya tenía filas, borrarla JUSTO antes de recargarla: así la
         # carga es idempotente (nunca duplica) y nunca deja hueco mayor al día en
         # vuelo si el job se interrumpe. Aplica a --reprocess y a la ventana móvil.
+        order_ids_this_date = [o["order_id"] for o in order_rows]
+
         if ds in loaded:
             del_err = delete_date(bq, ref_orders, ref_items, ds)
             if del_err:
                 print(f"\n  ❌ {ds}: DELETE error → {del_err}  ({processed}/{len(dates_pending)})")
                 bq_errors += 1
                 continue
+
+        # order_items_sku no tiene creation_date (ver SCHEMA_ITEMS_SKU) — se
+        # borra siempre por order_id, esté o no la fecha en `loaded`, porque
+        # una orden puede existir en daily_orders sin haber tenido nunca fila
+        # acá (todo lo previo a este fix). Es barato: cero filas si no había.
+        del_sku_err = delete_order_ids_from_sku(bq, ref_items_sku, order_ids_this_date)
+        if del_sku_err:
+            print(f"\n  ❌ {ds}: DELETE order_items_sku error → {del_sku_err}  ({processed}/{len(dates_pending)})")
+            bq_errors += 1
+            continue
 
         # Cargar a BQ (batch)
         err_o = bq_load(bq, ref_orders, SCHEMA_ORDERS, order_rows)
@@ -826,10 +903,18 @@ def main():
                 bq_errors += 1
                 continue
 
-        total_orders += len(order_rows)
-        total_items  += len(item_rows)
-        dates_ok     += 1
-        print(f"✅ {len(order_rows)} órdenes / {len(item_rows)} items  ({processed}/{len(dates_pending)})")
+        if item_sku_rows:
+            err_isku = bq_load(bq, ref_items_sku, SCHEMA_ITEMS_SKU, item_sku_rows)
+            if err_isku:
+                print(f"\n  ❌ {ds}: BQ order_items_sku error → {err_isku}  ({processed}/{len(dates_pending)})")
+                bq_errors += 1
+                continue
+
+        total_orders    += len(order_rows)
+        total_items     += len(item_rows)
+        total_items_sku += len(item_sku_rows)
+        dates_ok        += 1
+        print(f"✅ {len(order_rows)} órdenes / {len(item_rows)} items / {len(item_sku_rows)} items_sku  ({processed}/{len(dates_pending)})")
 
     print()
     print("🎉 Listo.")
@@ -837,6 +922,7 @@ def main():
     print(f"   Fechas sin órdenes  : {dates_empty}")
     print(f"   Órdenes cargadas    : {total_orders:,}")
     print(f"   Items cargados      : {total_items:,}")
+    print(f"   Items con SKU       : {total_items_sku:,}")
     print(f"   Errores API VTEX    : {api_errors}")
     print(f"   Errores detalle ord.: {detail_errors}")
     print(f"   Errores BQ          : {bq_errors}")
