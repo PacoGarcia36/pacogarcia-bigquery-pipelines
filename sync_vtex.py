@@ -148,6 +148,12 @@ SCHEMA_ITEMS_SKU = [
     bigquery.SchemaField("ref_id",     "STRING",  mode="NULLABLE"),
     bigquery.SchemaField("quantity",   "INTEGER", mode="NULLABLE"),
     bigquery.SchemaField("price",      "NUMERIC", mode="NULLABLE"),
+    # Costo real del item AL MOMENTO DEL PEDIDO (item.costPrice de VTEX, mismo
+    # crudo sin dividir que price). Antes el margen solo tenia el snapshot MAS
+    # RECIENTE de costo (vtex_data.sku_cost_snapshot), que no refleja el costo
+    # real vigente cuando se vendio si el costo cambio despues. Confirmado en
+    # vivo el 2026-10-02 contra pedidos reales.
+    bigquery.SchemaField("cost_price", "NUMERIC", mode="NULLABLE"),
     bigquery.SchemaField("loaded_at",  "TIMESTAMP", mode="NULLABLE"),
 ]
 
@@ -903,6 +909,7 @@ def main():
                     "ref_id":     item.get("refId"),
                     "quantity":   item.get("quantity"),
                     "price":      item.get("price"),
+                    "cost_price": item.get("costPrice"),
                     "loaded_at":  synced_at,
                 })
 
