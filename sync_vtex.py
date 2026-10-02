@@ -120,6 +120,8 @@ SCHEMA_ORDERS = [
     bigquery.SchemaField("discount_value",  "FLOAT",     mode="NULLABLE"),
     bigquery.SchemaField("customer_email",    "STRING",  mode="NULLABLE"),
     bigquery.SchemaField("customer_document", "STRING",  mode="NULLABLE"),
+    bigquery.SchemaField("coupon",          "STRING",    mode="NULLABLE"),
+    bigquery.SchemaField("invoiced_at",     "TIMESTAMP", mode="NULLABLE"),
     bigquery.SchemaField("synced_at",       "TIMESTAMP", mode="NULLABLE"),
 ]
 
@@ -807,6 +809,8 @@ def main():
             discount_value    = None
             customer_email    = None
             customer_document = None
+            coupon            = None
+            invoiced_at       = None
             if detail:
                 try:
                     client = detail.get("clientProfileData") or {}
@@ -814,6 +818,12 @@ def main():
                     customer_document = client.get("document") or None
                 except Exception:
                     pass
+                try:
+                    coupon = (detail.get("marketingData") or {}).get("coupon") or None
+                    invoiced_at = detail.get("invoicedDate") or None
+                except Exception:
+                    coupon = None
+                    invoiced_at = None
                 try:
                     logistics = detail.get("shippingData", {}).get("logisticsInfo", [{}])
                     if logistics:
@@ -859,6 +869,8 @@ def main():
                 "discount_value":  discount_value,
                 "customer_email":    customer_email,
                 "customer_document": customer_document,
+                "coupon":          coupon,
+                "invoiced_at":     invoiced_at,
                 "synced_at":       synced_at,
             })
 
