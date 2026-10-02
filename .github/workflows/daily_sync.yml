@@ -149,16 +149,25 @@ jobs:
       # sale NULL y las consultas lo ignoran en silencio. El 2026-09-22 se
       # completaron los 9.530 SKUs faltantes y la cobertura quedo en 100%.
       #
-      # Sin flags carga SOLO los SKUs que todavia no tienen costo, asi que en una
-      # corrida normal son los productos dados de alta ese dia: tarda segundos.
+      # Desde 2026-10-02 sales_with_cmv usa PRIMERO el costPrice real de cada
+      # pedido (capturado en order_items_sku al momento de la venta), y recien
+      # si falta cae a la foto mas reciente de esta tabla. Esta foto pasa a ser
+      # el respaldo, no la fuente principal -- pero sigue siendo la UNICA fuente
+      # de costo para productos que todavia no se vendieron (ej: recien dados de
+      # alta), asi que conviene que no tenga huecos de dias sin actualizar.
       #
-      # Los lunes temprano refresca TODO el catalogo activo. Eso cuesta ~80 min de
-      # llamadas a VTEX, pero es lo unico que va armando la serie historica de
-      # precios. Sin ella no se puede datar un cambio de precio: cuando quisimos
-      # saber si las subas de septiembre eran anteriores al Paco Sale, la unica
-      # evidencia disponible eran los precios de las ordenes, que solo existen si
-      # el producto se vendio. La tabla es append-only, cada corrida agrega una
-      # foto nueva y nunca pisa las anteriores.
+      # Por eso ahora corre COMPLETO (--todos) todos los dias en vez de solo los
+      # lunes: ~80 min de llamadas a VTEX, pero asegura que un producto nuevo
+      # tenga costo de respaldo desde el dia 1, sin esperar a la corrida semanal.
+      # La tabla sigue siendo append-only (nunca pisa fotos anteriores), asi que
+      # tambien se sigue construyendo la serie historica de precios con mas
+      # densidad que antes.
+      #
+      # Una sola vez por dia, no las dos corridas: este workflow dispara dos
+      # veces (ver comentario arriba del todo), pero duplicar ~80 min de consulta
+      # completa a la API de Pricing en la corrida del mediodia no suma nada --
+      # el costo de un SKU no cambia entre una corrida y la otra del mismo dia.
+      # Se ata a la corrida de las 03:30 UTC (la que cierra el dia anterior).
       #
       # Va al final y despues del cooldown de VTEX a proposito: comparte el rate
       # limit con sync_vtex y verify_vtex, y no tiene sentido que compita con
@@ -173,11 +182,10 @@ jobs:
           VTEX_APP_TOKEN: ${{ secrets.VTEX_APP_TOKEN }}
           GCP_PROJECT: ${{ secrets.GCP_PROJECT }}
         run: |
-          if [ "$(date -u +%u)" = "1" ] && [ "$(date -u +%H)" -lt 10 ]; then
-            echo "Lunes temprano: refresco completo del catalogo para la serie de precios"
+          if [ "$(date -u +%H)" -lt 10 ]; then
             python sync_sku_costs.py --todos
           else
-            python sync_sku_costs.py
+            echo "Corrida del mediodia: la foto completa de hoy ya se hizo en la de las 03:30 UTC"
           fi
 
       # El snapshot de stock NO corre acá: vive en su propio workflow
